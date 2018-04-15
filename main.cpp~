@@ -1,0 +1,70 @@
+#include "token.h"
+#include "parse.h"
+#include <string>
+#include <stdio.h>
+#include <ctype.h>
+#include <stdlib.h>
+
+/* use static variable to hold a parse state*/
+static std::string identifierString;
+static std::string commentString;
+static double numberValue;
+
+int getToken(){
+  static int lastChar=' ';
+  while(isspace(lastChar)){
+    lastChar=getchar();
+  }
+  if(isalpha(lastChar)){
+    identifierString=lastChar;
+    while(isalnum(lastChar=getchar())){
+      identifierString+=lastChar;
+    }
+    if(identifierString=="def")return tok_def;
+    if(identifierString=="extern") return tok_extern;
+    return tok_identifier;
+  }
+  else if(isdigit(lastChar)||lastChar=='.'){
+    std::string numberString;
+    do{
+      numberString += lastChar;
+      lastChar=getchar();
+    }while (isdigit(lastChar)||lastChar=='.');
+    numberValue=strtod(numberString.c_str(),0);
+    return tok_number;
+  }
+  else if(lastChar=='#'){
+    do{
+      lastChar=getchar();
+      commentString+=lastChar;
+    }while(lastChar != EOF && lastChar != '\n' && lastChar != '\r');
+    return tok_comment;
+  }
+  return tok_number;
+}
+
+class Expr{
+public:
+  virtual ~Expr(){}
+};
+
+class Number: public Expr{
+  double value;
+public:
+  Number(double v):value(v){}
+};
+
+class Variable: public Expr{
+  std::string name;
+public:
+  Variable(const std::string &name): name(name){}
+};
+
+int main(){
+  int a=getToken();
+  printf("get type: %d  string: %s value: %f  comment: %s\n",a,identifierString.c_str(), numberValue,
+	 commentString.c_str()
+	 );
+  return 0;
+}
+
