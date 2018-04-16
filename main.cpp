@@ -1,5 +1,10 @@
 #include "parse.h"
 #include "token.h"
+#include "llvm/ADT/APFloat.h"
+#include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/Module.h"
+#include "llvm/IR/Value.h"
+#include "llvm/IR/Verifier.h"
 #include <ctype.h>
 #include <iostream>
 #include <map>
@@ -8,12 +13,11 @@
 #include <stdlib.h>
 #include <string>
 #include <vector>
-#include "llvm/IR/Value.h"
-#include "llvm/IR/IRBuilder.h"
-#include "llvm/ADT/APFloat.h"
-
 
 #define Value llvm::Value
+#define FunctionType llvm::FunctionType
+#define Type llvm::Type
+#define BasicBlock llvm::BasicBlock
 #define Module llvm::Module
 #define getGlobalContext llvm::getGlobalContext
 #define ConstantFP llvm::ConstantFP
@@ -21,6 +25,7 @@
 #define IRBuilder llvm::IRBuilder
 
 #define APFloat llvm::APFloat
+#define verifyFunction llvm::verifyFunction
 
 /* use static variable to hold a parse state*/
 static std::string identifierString;
@@ -32,7 +37,7 @@ static int currentPos;
 static int tokStartPos;
 int getcharInString() {
   char a;
-  if (currentPos >=(int) currentInput.size()) {
+  if (currentPos >= (int)currentInput.size()) {
     currentPos = currentInput.size() + 1;
     return EOF;
   } else {
@@ -84,16 +89,16 @@ int getToken() {
   }
 }
 
-static std::unique_ptr<Module> *module;
+static std::unique_ptr<Module> module;
 static IRBuilder<> builder(getGlobalContext());
-static std::map<std::string, Value*> namedValues;
+static std::map<std::string, Value *> namedValues;
 
-Value * errorValue(const char* info);
+Value *errorValue(const char *info);
 class Expr {
 public:
   virtual ~Expr() {}
   virtual std::string toString() { return std::string("Expr"); }
-  virtual Value *codegen() {return nullptr;};
+  virtual Value *codegen() { return nullptr; };
 };
 
 class Number : public Expr {
@@ -104,8 +109,8 @@ public:
   virtual std::string toString() {
     return std::string("Number:") + std::to_string(value);
   }
-  virtual Value *codegen(){
-    return ConstantFP::get(getGlobalContext(),APFloat(value));
+  virtual Value *codegen() {
+    return ConstantFP::get(getGlobalContext(), APFloat(value));
   }
 };
 
@@ -115,14 +120,14 @@ class Variable : public Expr {
 public:
   Variable(const std::string &name) : name(name) {}
   virtual std::string toString() { return std::string("Variable:") + name; }
-  virtual Value* codegen(){
-    Value *v =namedValues[name];
-    std::string info=std::string("no such variable: ");
-    if(!v)errorValue((info+name).c_str());
+  virtual Value *codegen() {
+    Value *v = namedValues[name];
+    std::string info = std::string("no such variable: ");
+    if (!v)
+      errorValue((info + name).c_str());
     return v;
   }
 };
-
 
 class BinaryExpr : public Expr {
   std::string op;
@@ -140,19 +145,22 @@ public:
     result.append(right.get()->toString() + "]");
     return result;
   }
-  virtual Value* codegen(){
-    Value* l= left->codegen();
-    Value* r=right->codegen();
-    if(!l||!r) return nullptr;
-    switch(op[0]){
+  virtual Value *codegen() {
+    Value *l = left->codegen();
+    Value *r = right->codegen();
+    if (!l || !r)
+      return nullptr;
+    switch (op[0]) {
     case '+':
-      return builder.CreateFAdd(l,r,"addtmp");
+      return builder.CreateFAdd(l, r, "addtmp");
     case '-':
-      return builder.CreateFSub(l,r,"subtmp");
+      return builder.CreateFSub(l, r, "subtmp");
     case '*':
-      return builder.CreateFMul(l,r,"multmp");
+      return builder.CreateFMul(l, r, "multmp");
     case '<':
-      return builder.CreateFCmpULT(l,r,"cmptmp");
+      l = builder.CreateFCmpULT(l, r, "cmptmp");
+      return builder.CreateUIToFP(l, Type::getDoubleTy(getGlobalContext()),
+                                  "booltmp");
     default:
       return errorValue("invalid binary opeator");
     }
@@ -178,13 +186,26 @@ public:
     result.append("]");
     return result;
   }
+  virtual Value *codegen() {
+    llvm::Function *func = module->getFunction(funcName);
+    if (!func)
+      return errorValue("Unknown function referenced!");
+    if (func->arg_size() != args.size())
+      return errorValue("args number is not matched");
+    std::vector<Value *> argv;
+    for (unsigned i = 0, length = args.size(); i < length; i++) {
+      argv.push_back(args[i]->codegen());
+      if (!argv.back())
+        return nullptr;
+    }
+    return builder.CreateCall(func, argv, "calltmp");
+  }
 };
 
 class Prototype : public Expr {
+public:
   std::string funcName;
   std::vector<std::string> argsName;
-
-public:
   Prototype(const std::string &name, std::vector<std::string> args)
       : funcName(name), argsName(std::move(args)) {}
 
@@ -199,6 +220,19 @@ public:
     result.append(")");
     return result;
   }
+  virtual llvm::Function *codegen() {
+    std::vector<Type *> doubles(argsName.size(),
+                                Type::getDoubleTy(getGlobalContext()));
+    FunctionType *funcType = FunctionType::get(
+        Type::getDoubleTy(getGlobalContext()), doubles, false);
+    llvm::Function *func = llvm::Function::Create(
+        funcType, llvm::Function::ExternalLinkage, funcName, module.get());
+    unsigned Idx = 0;
+    for (auto &arg : func->args()) {
+      arg.setName(argsName[Idx++]);
+    }
+    return func;
+  }
 };
 
 class Function : public Expr {
@@ -212,6 +246,28 @@ public:
     std::string result = proto.get()->toString();
     result.append("(" + body.get()->toString() + ")");
     return result;
+  }
+  virtual llvm::Function *codegen() {
+    llvm::Function *func = module->getFunction(proto->funcName);
+    if (!func)
+      func = proto->codegen();
+    if (!func)
+      return nullptr;
+    if (!func->empty())
+      return (llvm::Function *)errorValue("function cannot be redefined!");
+    BasicBlock *bb = BasicBlock::Create(getGlobalContext(), "entry", func);
+    builder.SetInsertPoint(bb);
+    namedValues.clear();
+    for (auto &arg : func->args()) {
+      namedValues[arg.getName()] = &arg;
+    }
+    if (Value *funcRet = body->codegen()) {
+      builder.CreateRet(funcRet);
+      verifyFunction(*func);
+      return func;
+    }
+    func->eraseFromParent();
+    return nullptr;
   }
 };
 
@@ -232,7 +288,7 @@ std::unique_ptr<Prototype> errorPrototype(const char *info) {
   return nullptr;
 }
 
-Value * errorValue(const char* info){
+Value *errorValue(const char *info) {
   error(info);
   return nullptr;
 }
@@ -430,24 +486,40 @@ void printParseExpr() {
 
   switch (currentToken) {
   case tok_def:
-    print(parseFunctionDefinition().get());
+    if (auto expr = parseFunctionDefinition()) {
+      print(expr.get());
+      if (auto *fIR = expr->codegen())
+        fIR->dump();
+    }
     break;
   case tok_extern:
-    print(parseExtern().get());
+    if (auto expr = parseExtern()) {
+      print(expr.get());
+      if (auto *fIR = expr->codegen())
+        fIR->dump();
+    }
     break;
   case tok_eof:
     std::cout << "empty input!" << std::endl;
     break;
   default:
-    print(parseTopLevelExpr().get());
+    if (auto expr = parseTopLevelExpr()) {
+      print(expr.get());
+      if (auto *fIR = expr->codegen())
+        fIR->dump();
+    }
     break;
   }
 }
-
+void initModule() {
+  module = std::make_unique<Module>("jit", getGlobalContext());
+}
 int main() {
   defineBinaryOpPrecedence();
+  initModule();
   while (readLine()) {
     printParseExpr();
+    module->dump();
   }
   return 0;
 }
